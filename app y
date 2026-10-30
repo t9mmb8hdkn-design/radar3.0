@@ -1,0 +1,204 @@
+import re
+from urllib.parse import quote
+
+import feedparser
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+
+st.set_page_config(page_title="Radar Bourse 2.0", page_icon="📡", layout="wide")
+
+# =====================================================================
+# 1. LES GRANDES TENDANCES MONDIALES
+# =====================================================================
+TENDANCES = {
+    "🤖 IA & semi-conducteurs": {
+        "etf": "SMH",
+        "actions": ["NVDA", "AVGO", "AMD", "TSM", "ASML", "PLTR", "ARM"],
+        "pourquoi": "Les géants du cloud (Microsoft, Google, Amazon, Meta) investissent des centaines de milliards dans les data centers. Puces et logiciels d'IA sont au cœur de cette vague.",
+        "risques": "Valorisations élevées, dépendance à quelques gros clients, restrictions d'export vers la Chine, risque de 'bulle'.",
+    },
+    "🛡️ Cybersécurité": {
+        "etf": "CIBR",
+        "actions": ["CRWD", "PANW", "ZS", "NET", "FTNT"],
+        "pourquoi": "Explosion des cyberattaques, tensions géopolitiques et nouvelles obligations réglementaires : la sécurité devient une dépense incontournable.",
+        "risques": "Concurrence forte, valorisations élevées, une panne majeure peut nuire à la réputation.",
+    },
+    "⚛️ Nucléaire & uranium": {
+        "etf": "URA",
+        "actions": ["CCJ", "CEG", "VST", "OKLO", "SMR"],
+        "pourquoi": "Les data centers d'IA ont besoin d'une électricité énorme et stable. Le nucléaire revient en grâce (soutien des États, petits réacteurs SMR).",
+        "risques": "Projets très longs, dépendance aux autorisations publiques, certaines sociétés n'ont pas encore de revenus.",
+    },
+    "⚡ Électrification & réseaux": {
+        "etf": "GRID",
+        "actions": ["ETN", "VRT", "GEV", "SU.PA", "PWR"],
+        "pourquoi": "Il faut moderniser les réseaux électriques pour les data centers, les voitures électriques et la relocalisation industrielle.",
+        "risques": "Secteur cyclique, sensible aux taux d'intérêt et aux budgets d'investissement.",
+    },
+    "🌱 Énergies renouvelables": {
+        "etf": "ICLN",
+        "actions": ["FSLR", "ENPH", "NEE", "ORSTED.CO"],
+        "pourquoi": "Transition énergétique et objectifs climat, coûts du solaire en baisse.",
+        "risques": "Très dépendant des subventions et des décisions politiques (ex : changements aux États-Unis), sensible aux taux.",
+    },
+    "🎖️ Défense & souveraineté": {
+        "etf": "ITA",
+        "actions": ["RHM.DE", "HO.PA", "SAF.PA", "LMT", "RTX"],
+        "pourquoi": "Réarmement de l'Europe, hausse des budgets militaires de l'OTAN, conflits en cours.",
+        "risques": "Un accord de paix ou des coupes budgétaires peuvent faire chuter le secteur, enjeux éthiques.",
+    },
+    "🧬 Santé & longévité": {
+        "etf": "XLV",
+        "actions": ["LLY", "NVO", "VRTX", "ISRG"],
+        "pourquoi": "Vieillissement de la population, traitements contre l'obésité (GLP-1), chirurgie robotisée.",
+        "risques": "Pression politique sur le prix des médicaments, échecs d'essais cliniques.",
+    },
+    "🦾 Robotique & automatisation": {
+        "etf": "BOTZ",
+        "actions": ["TSLA", "ROK", "SYM", "TER", "ABBN.SW"],
+        "pourquoi": "Manque de main-d'œuvre, relocalisation des usines, robots humanoïdes et IA physique.",
+        "risques": "Promesses parfois lointaines, forte volatilité.",
+    },
+    "🚀 Spatial": {
+        "etf": "UFO",
+        "actions": ["RKLB", "ASTS", "LUNR"],
+        "pourquoi": "Baisse du coût des lancements, constellations de satellites, budgets de défense spatiale.",
+        "risques": "Entreprises souvent non rentables, très spéculatives, besoin de lever de l'argent.",
+    },
+    "💳 Fintech & paiements": {
+        "etf": "FINX",
+        "actions": ["HOOD", "SOFI", "NU", "ADYEN.AS", "MELI"],
+        "pourquoi": "Numérisation de la banque, nouvelles générations d'investisseurs, paiements mobiles dans les pays émergents.",
+        "risques": "Régulation, sensibilité aux cycles de crédit et à l'activité des particuliers en bourse.",
+    },
+}
+
+MOTS_CLES = {
+    "🏛️ Taux / banques centrales": ["fed", "bce", "taux", "powell", "lagarde", "inflation"],
+    "🚢 Douane / commerce": ["douane", "douanes", "tarif", "tarifs", "tariff", "tariffs", "export", "exportations"],
+    "💶 Subventions / plans publics": ["subvention", "subventions", "chips act", "plan", "aide publique", "budget"],
+    "⚔️ Géopolitique / défense": ["guerre", "otan", "nato", "ukraine", "chine", "taïwan", "sanction", "sanctions", "défense"],
+    "⚖️ Régulation / justice": ["régulation", "antitrust", "amende", "enquête", "sec", "bruxelles", "procès"],
+    "📊 Résultats / contrats": ["résultats", "chiffre d'affaires", "bénéfice", "contrat", "commande", "prévisions", "earnings"],
+}
+
+# =====================================================================
+# 2. CHARGEMENT DES DONNÉES
+# =====================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def charger_prix(tickers):
+    data = yf.download(list(tickers), period="1y", auto_adjust=True, progress=False, threads=True)
+    close, volume = data["Close"], data["Volume"]
+    if isinstance(close, pd.Series):
+        close, volume = close.to_frame(tickers[0]), volume.to_frame(tickers[0])
+    return close.ffill(), volume
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def charger_infos(ticker):
+    try:
+        return yf.Ticker(ticker).info or {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def actualites(requete, n=8):
+    url = f"https://news.google.com/rss/search?q={quote(requete)}&hl=fr&gl=FR&ceid=FR:fr"
+    flux = feedparser.parse(url)
+    return [
+        {"titre": e.title, "lien": e.link, "date": e.get("published", "")[:16], "tags": etiqueter(e.title)}
+        for e in flux.entries[:n]
+    ]
+
+
+def etiqueter(texte):
+    texte = texte.lower()
+    return [cat for cat, mots in MOTS_CLES.items()
+            if any(re.search(r"\b" + re.escape(m) + r"\b", texte) for m in mots)]
+
+# =====================================================================
+# 3. INDICATEURS ET SCORES
+# =====================================================================
+def indicateurs(close, volume, bench, etf):
+    c = close.dropna()
+    if len(c) < 130:
+        return None
+    r = c.pct_change().dropna()
+
+    def perf(s, n):
+        s = s.dropna()
+        return s.iloc[-1] / s.iloc[-n - 1] - 1 if len(s) > n else np.nan
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+    perte = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+    rsi = 100 - 100 / (1 + gain / perte) if perte > 0 else 100
+
+    v = volume.dropna()
+    base = v.iloc[-120:-20].mean() if len(v) > 120 else np.nan
+    vol_ratio = v.iloc[-20:].mean() / base if base and base > 0 else np.nan
+
+    corr = r.iloc[-126:].corr(etf.pct_change().iloc[-126:])
+
+    return {
+        "prix": c.iloc[-1],
+        "perf_1m": perf(c, 21), "perf_3m": perf(c, 63), "perf_6m": perf(c, 126),
+        "perf_1a": c.iloc[-1] / c.iloc[0] - 1,
+        "ma50": c.rolling(50).mean().iloc[-1],
+        "ma200": c.rolling(min(200, len(c))).mean().iloc[-1],
+        "rsi": rsi,
+        "volatilite": r.std() * np.sqrt(252),
+        "dist_haut": c.iloc[-1] / c.max() - 1,
+        "vol_ratio": vol_ratio,
+        "force_rel": perf(c, 126) - perf(bench, 126),
+        "perf_theme": perf(etf, 126),
+        "corr_theme": corr,
+    }
+
+
+def borne(x):
+    return float(np.clip(x, 0, 100))
+
+
+def score_momentum(i):
+    s = 50 + i["perf_6m"] * 60 + i["force_rel"] * 40
+    s += 10 if i["prix"] > i["ma200"] else -10
+    s += 5 if i["ma50"] > i["ma200"] else -5
+    return borne(s)
+
+
+def score_fondamentaux(f):
+    if not f or f.get("revenueGrowth") is None:
+        return 50.0
+    s = 40
+    rg, eg = f.get("revenueGrowth") or 0, f.get("earningsGrowth")
+    gm, pm = f.get("grossMargins"), f.get("profitMargins")
+    dte, fpe = f.get("debtToEquity"), f.get("forwardPE")
+    s += 25 if rg > 0.3 else 15 if rg > 0.15 else 5 if rg > 0.05 else -15 if rg < 0 else 0
+    if eg is not None:
+        s += 10 if eg > 0.25 else -10 if eg < 0 else 0
+    if gm is not None and gm > 0.5:
+        s += 10
+    if pm is not None:
+        s += 10 if pm > 0.15 else -15 if pm < 0 else 0
+    if dte is not None and dte > 200:
+        s -= 10
+    if fpe is not None:
+        s += 5 if 0 < fpe < 30 else -10 if fpe > 80 else 0
+    return borne(s)
+
+
+def score_tendance(i):
+    corr = 0 if np.isnan(i["corr_theme"]) else i["corr_theme"]
+    pt = 0 if np.isnan(i["perf_theme"]) else i["perf_theme"]
+    return borne(50 + corr * 30 + pt * 60)
+
+
+def score_risque(i, f):
+    s = 30 + (i["volatilite"] - 0.3) * 80
+    s += 15 if i["rsi"]
